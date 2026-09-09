@@ -132,20 +132,14 @@ func NewRunner(writer EventWriter, cfg Config) *Runner {
 // Run executes args. The first leading KEY=VALUE pairs are extracted as env
 // vars (devtap parity). Stdout/stderr are tee'd to the terminal; lines that
 // pass the filter accumulate into a batch and flush every runnerBatchSize
-// lines. A "started" event is emitted on entry; "completed" on exit.
+// lines. A "started" event is emitted only after the child starts successfully;
+// "completed" is emitted after it exits.
 func (r *Runner) Run(ctx context.Context, args []string) (*RunResult, error) {
-	cmd, err := buildCommand(args)
+	cmd, err := buildCommandContext(ctx, args)
 	if err != nil {
 		return nil, err
 	}
 	applyForceColor(cmd, r.cfg.ForceColor)
-
-	start := time.Now()
-	r.emit(ctx, Event{
-		Timestamp: start.UTC(),
-		EventType: EventTypeStarted,
-		Message:   "started: " + r.cfg.Command,
-	})
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -157,9 +151,15 @@ func (r *Runner) Run(ctx context.Context, args []string) (*RunResult, error) {
 	}
 	cmd.Stdin = os.Stdin
 
+	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	r.emit(ctx, Event{
+		Timestamp: start.UTC(),
+		EventType: EventTypeStarted,
+		Message:   "started: " + r.cfg.Command,
+	})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -278,18 +278,11 @@ func NewLongRunner(writer EventWriter, cfg Config, debounce time.Duration) *Long
 // Run executes args, forwards SIGINT/SIGTERM to the child, and flushes
 // buffered output every debounce interval.
 func (r *LongRunner) Run(ctx context.Context, args []string) (*RunResult, error) {
-	cmd, err := buildCommand(args)
+	cmd, err := buildCommandContext(ctx, args)
 	if err != nil {
 		return nil, err
 	}
 	applyForceColor(cmd, r.cfg.ForceColor)
-
-	start := time.Now()
-	r.emit(ctx, Event{
-		Timestamp: start.UTC(),
-		EventType: EventTypeStarted,
-		Message:   "watching: " + r.cfg.Command,
-	})
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -301,9 +294,15 @@ func (r *LongRunner) Run(ctx context.Context, args []string) (*RunResult, error)
 	}
 	cmd.Stdin = os.Stdin
 
+	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	r.emit(ctx, Event{
+		Timestamp: start.UTC(),
+		EventType: EventTypeStarted,
+		Message:   "watching: " + r.cfg.Command,
+	})
 
 	// Forward parent SIGINT/SIGTERM to the child so Ctrl-C cleans up.
 	sigCh := make(chan os.Signal, 1)
@@ -426,9 +425,19 @@ func (r *LongRunner) emit(ctx context.Context, evt Event) {
 
 // buildCommand creates an exec.Cmd from args, extracting leading KEY=VALUE
 // pairs as env vars (matches devtap's `--  KEY=VAL cmd ...` ergonomics).
+// It uses a background context for callers/tests that only need command
+// construction; Runner and LongRunner use buildCommandContext so cancellation
+// reaches the child process.
 func buildCommand(args []string) (*exec.Cmd, error) {
+	return buildCommandContext(context.Background(), args)
+}
+
+func buildCommandContext(ctx context.Context, args []string) (*exec.Cmd, error) {
 	if len(args) == 0 {
 		return nil, errNoCommand
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	var envVars []string
 	i := 0
@@ -443,7 +452,7 @@ func buildCommand(args []string) (*exec.Cmd, error) {
 	if i >= len(args) {
 		return nil, errNoCommand
 	}
-	cmd := exec.Command(args[i], args[i+1:]...) //nolint:gosec
+	cmd := exec.CommandContext(ctx, args[i], args[i+1:]...) //nolint:gosec
 	if len(envVars) > 0 {
 		cmd.Env = append(os.Environ(), envVars...)
 	}
